@@ -38,7 +38,6 @@ class SEBlock(nn.Module):
     def __init__(self, channel, ratio=2, use_hs=True):
         super(SEBlock, self).__init__()
         self.avg_pool = nn.AdaptiveAvgPool2d(1)
-        print(f'channel: {channel}, ratio: {ratio}')
         self.fc = nn.Sequential(
             nn.Linear(channel, channel // ratio, bias=False),
             nn.ReLU(inplace=True),
@@ -90,7 +89,7 @@ class ChannelBlock(nn.Module):
             nn.Linear(channel // ratio, channel, bias=False),
         )
 
-        self.sigmoid = HSigmoid if use_hs else nn.Sigmoid()
+        self.sigmoid = HSigmoid() if use_hs else nn.Sigmoid()
 
     def forward(self, x):
         b, c, _, _ = x.size()
@@ -118,7 +117,7 @@ class SpatialBlock(nn.Module):
                               kernel_size=kernel_size,
                               padding=padding,
                               stride=1)
-        self.sigmoid = HSigmoid if use_hs else nn.Sigmoid()
+        self.sigmoid = HSigmoid() if use_hs else nn.Sigmoid()
 
     def forward(self, x):
         max_x, _ = torch.max(x, dim=1, keepdim=True)
@@ -178,8 +177,8 @@ class CABlock(nn.Module):
                              kernel_size=1,
                              stride=1,
                              bias=False)
-        self.sigmoid_h = HSigmoid if use_hs else nn.Sigmoid()
-        self.sigmoid_w = HSigmoid if use_hs else nn.Sigmoid()
+        self.sigmoid_h = HSigmoid() if use_hs else nn.Sigmoid()
+        self.sigmoid_w = HSigmoid() if use_hs else nn.Sigmoid()
 
     def forward(self, x):
 
@@ -214,8 +213,11 @@ def __test_attention():
     ca_out = ca_block(input_x)
 
     print(se_block)
+    print(eca_block)
+    print(cbam_block)
+    print(ca_block)
 
 
 if __name__ == '__main__':
-    # __test_attention()
-    pass
+    __test_attention()
+    # pass
