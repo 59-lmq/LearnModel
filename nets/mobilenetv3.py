@@ -5,15 +5,13 @@ Searching for MobileNetV3
 arXiv preprint arXiv:1905.02244.
 """
 
-
 from torchsummary import summary
-from attention import *
 
-import math
+from attention import *
 
 __all__ = ['mobilenet_v3_large', 'mobilenet_v3_small']
 
-attention_list = [SEBlock, ECABlock, CBAMBlock, CABlock]
+attention_list = [nn.Identity, SEBlock, ECABlock, CBAMBlock, CABlock]
 
 
 def _make_divisible(v, divisor, min_value=None):
@@ -76,6 +74,7 @@ class InvertedResidual(nn.Module):
     """
     MobileNetV2的具有线性瓶颈的倒残差结构，也是MobileNetV3的基本模块，加入了SE注意力机制
     """
+
     def __init__(self, inp, hidden_dim, oup, kernel_size,
                  stride, use_se, use_hs):
         super(InvertedResidual, self).__init__()
@@ -91,7 +90,7 @@ class InvertedResidual(nn.Module):
                 nn.BatchNorm2d(hidden_dim),
                 HSwish() if use_hs else nn.ReLU(inplace=True),
                 # 注意力机制
-                attention_list[use_hs](hidden_dim, use_hs=use_hs) if use_se else nn.Identity(),
+                attention_list[use_se](hidden_dim),
                 # pw-linear
                 nn.Conv2d(hidden_dim, oup, 1, 1, 0, bias=False),
                 nn.BatchNorm2d(oup),
@@ -107,9 +106,9 @@ class InvertedResidual(nn.Module):
                           groups=hidden_dim, bias=False),
                 nn.BatchNorm2d(hidden_dim),
                 # 注意力机制
-                attention_list[use_hs](hidden_dim, use_hs=use_hs) if use_se else nn.Identity(),
+                attention_list[use_se](hidden_dim),
                 HSwish() if use_hs else nn.ReLU(inplace=True),
-                # pw-linear: Pointwise Convolution，俗称叫做 1x1 卷积，简写为 PW，主要用于数据降维，减少参数量。
+                # pw-linear: PointWise Convolution，俗称叫做 1x1 卷积，简写为 PW，主要用于数据降维，减少参数量。
                 nn.Conv2d(hidden_dim, oup, 1, 1, 0, bias=False),
                 nn.BatchNorm2d(oup),
             )
@@ -117,16 +116,17 @@ class InvertedResidual(nn.Module):
     def forward(self, x):
         out = self.conv(x)
         if self.identity:  # 需要skip connection（跳接）
-            out = out+x
+            out = out + x
         return out
 
 
 class MobileNetV3(nn.Module):
     """MobileNetV3 网络结构"""
+
     def __init__(self, cfgs, mode, num_classes=10, width_mult=1.):
         """
 
-        :param cfgs: configs
+        :param cfgs: configs，字典格式
         :param mode: 模式，large or small
         :param num_classes: 分类的数量
         :param width_mult: 宽度乘数，用于控制网络的宽度
@@ -134,6 +134,8 @@ class MobileNetV3(nn.Module):
         super(MobileNetV3, self).__init__()
         # setting of inverted residual blocks
         self.cfgs = cfgs
+        cfg_keys = list(cfgs.keys())  # 获取所有的key
+        cfg_len = len(cfgs[cfg_keys[0]])  # 获取key的长度
         assert mode in ['large', 'small']
 
         # building first layer, 构建第一层，没有扩展expand
@@ -143,16 +145,25 @@ class MobileNetV3(nn.Module):
         # building inverted residual blocks，搭建 bottleneck residual blocks
         block = InvertedResidual  # 两头窄，中间胖的反残差结构，称为Inverted Residual
         exp_size = make_divisible(input_channel * 1, divisible_by=8)
+
         # k：kernel, t: expand_multi, c: output_channel, use_se:bool, use_hs:bool, s:stride
-        for k, t, c, use_se, use_hs, s in self.cfgs:
-            # output_channel = _make_divisible(c * width_mult, 8)
-            # exp_size = _make_divisible(input_channel * t, 8)
+        for idx in range(cfg_len):
+            k, t, c, use_att, use_hs, s = [self.cfgs[key][idx] for key in cfg_keys]
+            # print(f' idx:{idx}, k:{k}, t:{t}, c:{c}, use_at:{use_at}, use_hs:{use_hs}, s:{s}')
             output_channel = make_divisible(c * width_mult, divisible_by=8)
             exp_size = make_divisible(input_channel * t, divisible_by=8)
-            print('inp:{0}, exp:{2}, oup:{1}'.format(input_channel, output_channel, exp_size))
-            layers.append(block(input_channel, exp_size, output_channel,
-                                k, s, use_se, use_hs))
+            layers.append(block(input_channel, exp_size, output_channel, k, s, use_att, use_hs))
             input_channel = output_channel
+
+        # for k, t, c, use_se, use_hs, s in self.cfgs:
+        #     # output_channel = _make_divisible(c * width_mult, 8)
+        #     # exp_size = _make_divisible(input_channel * t, 8)
+        #     output_channel = make_divisible(c * width_mult, divisible_by=8)
+        #     exp_size = make_divisible(input_channel * t, divisible_by=8)
+        #     # print('inp:{0}, exp:{2}, oup:{1}'.format(input_channel, output_channel, exp_size))
+        #     layers.append(block(input_channel, exp_size, output_channel,
+        #                         k, s, use_se, use_hs))
+        #     input_channel = output_channel
 
         self.features = nn.Sequential(*layers)
         # building last several layers，搭建最后几层
@@ -199,71 +210,156 @@ class MobileNetV3(nn.Module):
                     m.bias.data.zero_()
 
 
-def mobilenet_v3_large(**kwargs):
+def mobilenet_v3_large(use_att: list = None, **kwargs):
     """
     Constructs a MobileNetV3-Large model
-    """
-    cfgs = [
-        # kernel, exp_size, output_channel, SE, HS, stride
-        # k, t, c, SE, HS, s
+     cfgs = [
+        # kernel, exp_size, output_channel, Attention, HS, stride
+        # k,  t,  c, Att, HS, s
         [3,   1,  16, 0, 0, 1],
         [3,   4,  24, 0, 0, 2],
         [3,   3,  24, 0, 0, 1],
+
         [5,   3,  40, 1, 0, 2],
         [5,   3,  40, 1, 0, 1],
         [5,   3,  40, 1, 0, 1],
+
         [3,   6,  80, 0, 1, 2],
         [3, 2.5,  80, 0, 1, 1],
         [3, 2.3,  80, 0, 1, 1],
+
         [3, 2.3,  80, 0, 1, 1],
         [3,   6, 112, 1, 1, 1],
         [3,   6, 112, 1, 1, 1],
+
         [5,   6, 160, 1, 1, 2],
         [5,   6, 160, 1, 1, 1],
         [5,   6, 160, 1, 1, 1]
     ]
-
-    return MobileNetV3(cfgs, mode='large', **kwargs)
-
-
-def mobilenet_v3_small(**kwargs):
+    :param use_att: list,
+        0: no att,
+        1: SE,
+        2: ECA,
+        3: CBAM,
+        4: CA
+    :param kwargs: other kwargs
+    :return: MobileNetV3-large model
     """
-    Constructs a MobileNetV3-Small model
-    """
-    cfgs = [
-        # kernel, exp_size, output_channel, SE, HS, stride
-        # k, t, c, SE, HS, s
-        [3,    1,  16, 1, 0, 2],
-        [3,  4.5,  24, 0, 0, 2],
-        [3, 3.67,  24, 0, 0, 1],
-        [5,    4,  40, 1, 1, 2],
-        [5,    6,  40, 1, 1, 1],
-        [5,    6,  40, 1, 1, 1],
-        [5,    3,  48, 1, 1, 1],
-        [5,    3,  48, 1, 1, 1],
-        [5,    6,  96, 1, 1, 2],
-        [5,    6,  96, 1, 1, 1],
-        [5,    6,  96, 1, 1, 1],
-    ]
+    att_list = [0, 0, 0,
+                1, 1, 1,
+                0, 0, 0,
+                0, 1, 1,
+                1, 1, 1]
+    if use_att:
+        assert len(use_att) == len(att_list)
+        att_list = use_att
+    cfgs_dict = {
+        'kernel': [3, 3, 3,
+                   5, 5, 5,
+                   3, 3, 3,
+                   3, 3, 3,
+                   5, 5, 5],
+        'expand_ratio': [1, 4, 3,
+                         3, 3, 3,
+                         6, 2.5, 2.3,
+                         2.3, 6, 6,
+                         6, 6, 6],
+        'output_channel': [16, 24, 24,
+                           40, 40, 40,
+                           80, 80, 80,
+                           80, 112, 112,
+                           160, 160, 160],
+        'use_att': att_list,
+        'use_hs': [False, False, False,
+                   False, False, False,
+                   True, True, True,
+                   True, True, True,
+                   True, True, True],
+        'stride': [1, 2, 1,
+                   2, 1, 1,
+                   2, 1, 1,
+                   1, 1, 1,
+                   2, 1, 1],
+    }
+    # return MobileNetV3(cfgs, mode='large', **kwargs)
+    return MobileNetV3(cfgs_dict, mode='large', **kwargs)
 
-    return MobileNetV3(cfgs, mode='small', **kwargs)
+
+def mobilenet_v3_small(use_att: list = None, **kwargs):
+    """
+    Constructs a MobileNetV3-Small model \n
+    attention_list = [nn.Identity, SEBlock, ECABlock, CBAMBlock, CABlock]\n
+    cfgs = [\n
+        # kernel, exp_size, output_channel, Att, HS, stride\n
+        # k,   t, c, Att, HS, s\n
+        [3,    1,  16, 1, 0, 2],\n
+        [3,  4.5,  24, 0, 0, 2],\n
+        [3, 3.67,  24, 0, 0, 1],\n
+
+        [5,    4,  40, 1, 1, 2],\n
+        [5,    6,  40, 1, 1, 1],\n
+        [5,    6,  40, 1, 1, 1],\n
+
+        [5,    3,  48, 1, 1, 1],\n
+        [5,    3,  48, 1, 1, 1],\n
+        [5,    6,  96, 1, 1, 2],\n
+
+        [5,    6,  96, 1, 1, 1],\n
+        [5,    6,  96, 1, 1, 1],\n
+    ]\n
+    :param use_att: list of attention modules
+    :param kwargs: other parameters
+    :return: MobileNetV3-Small model
+    """
+    att_list = [1, 0, 0,
+                1, 1, 1,
+                1, 1, 1,
+                1, 1]
+    if use_att:
+        assert len(use_att) == len(att_list)
+        att_list = use_att
+    cfgs_dict = {
+        'kernel': [3, 3, 3,
+                   5, 5, 5,
+                   5, 5, 5,
+                   5, 5],
+        'expand_ratio': [1, 4.5, 3.67,
+                         4, 6, 6,
+                         3, 3, 6,
+                         6, 6],
+        'output_channel': [16, 24, 24,
+                           40, 40, 40,
+                           48, 48, 96,
+                           96, 96],
+        'use_att': att_list,
+        'use_hs': [False, False, False,
+                   True, True, True,
+                   True, True, True,
+                   True, True],
+        'stride': [2, 2, 1,
+                   2, 1, 1,
+                   1, 1, 2,
+                   1, 1],
+    }
+
+    # return MobileNetV3(cfgs, mode='small', **kwargs)
+    return MobileNetV3(cfgs_dict, mode='small', **kwargs)
 
 
 def __test_function():
-    # net_large = mobilenet_v3_large(num_classes=10)
-    net_small = mobilenet_v3_small(num_classes=5)
+    import time
+    st_time = time.time()
+    net_large = mobilenet_v3_large(num_classes=10)
     # print(net_large)
+    summary(net_large.cuda(), (3, 224, 224))
+    print('Large Total params: %.2fM' % (sum(p.numel() for p in net_large.parameters())/1000000.0))
+    print(f'Large using time:{time.time() - st_time} s')
+
+    st_time = time.time()
+    net_small = mobilenet_v3_small(num_classes=10)
     summary(net_small.cuda(), (3, 224, 224))
-
-    # print('Large Total params: %.2fM' % (sum(p.numel() for p in net_large.parameters())/1000000.0))
     print('Small Total params: %.2fM' % (sum(p.numel() for p in net_small.parameters()) / 1000000.0))
-    # net_small = mobilenet_v3_small()
-
-    target = torch.randn(3, 5).cpu()
-    loss = nn.CrossEntropyLoss()
-    m = nn.Softmax(dim=1)
-    a = m(target)
-    print(a)
+    print(f'Small using time:{time.time() - st_time} s')
 
 
 if __name__ == '__main__':
