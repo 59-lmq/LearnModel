@@ -4,26 +4,53 @@ import torch
 from torch import nn
 
 
+class HSigmoid(nn.Module):
+    # MobileNetV3中提出的新的激活函数，用RelU(x+3)/6 简单替代 sigmoid，方便求导计算
+    def __init__(self, inplace=True):
+        super(HSigmoid, self).__init__()
+        self.relu = nn.ReLU6(inplace=inplace)
+
+    def forward(self, x):
+        return self.relu(x + 3) / 6
+
+
+class HSwish(nn.Module):
+    # 替代后的 swish 激活函数
+    def __init__(self, inplace=True):
+        super(HSwish, self).__init__()
+        self.sigmoid = HSigmoid(inplace=inplace)
+
+    def forward(self, x):
+        return x * self.sigmoid(x)
+
+
 class SEBlock(nn.Module):
     """
     SE: Squeeze-and-Excitation
+    参考 MnasNet 中的通道注意力机制，关键在于 Squeeze 和 Excitation
+    (1)Squeeze: 通过全局平均池化，将每个通道的二维特征（H*W）压缩为一个实数， 将特征图从 [h, w, c] -> [1, 1, c]
+    (2)Excitation: 给每个特征通道生成一个权重值，论文中通过两个全连接层构建通道间的相关性，
+                   输出的权重值数目和输入特征图的通道数相同。 即 [1, 1, c] -> [1, 1, c]
+    (3)Scale：将前面得到的归一化权重加权到每个通道的特征上。论文中使用的是乘法，逐个通道乘以权重系数。 [h, w, c] * [1, 1, c] -> [h, w, c]
+
     """
 
-    def __init__(self, channel, ratio=16):
+    def __init__(self, channel, ratio=2, use_hs=True):
         super(SEBlock, self).__init__()
         self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        print(f'channel: {channel}, ratio: {ratio}')
         self.fc = nn.Sequential(
             nn.Linear(channel, channel // ratio, bias=False),
             nn.ReLU(inplace=True),
             nn.Linear(channel // ratio, channel, bias=False),
-            nn.Sigmoid()
+            HSigmoid() if use_hs else nn.Sigmoid()
         )
 
     def forward(self, x):
-        b, c, _, _ = x.size()
-        y = self.avg_pool(x).view(b, c)
-        y = self.fc(y).view(b, c, 1, 1)
-        return x * y.expand_as(x)
+        b, c, _, _ = x.size()  # b, c, h, w
+        y = self.avg_pool(x).view(b, c)  # b, c, h, w -> b, c, 1, 1 -> b, c
+        y = self.fc(y).view(b, c, 1, 1)  # b, c -> b, c, 1, 1
+        return x * y.expand_as(x)  # b, c, h, w
 
 
 class ECABlock(nn.Module):
@@ -31,14 +58,14 @@ class ECABlock(nn.Module):
     ECA: Efficient Channel Attention
     """
 
-    def __init__(self, channel, gamma=2, b=1):
+    def __init__(self, channel, gamma=2, b=1, use_hs=True):
         super(ECABlock, self).__init__()
         self.avg_pool = nn.AdaptiveAvgPool2d(1)
         kernel_size = int(abs((math.log(channel, 2) + b) / gamma))
         kernel_size = kernel_size if kernel_size % 2 else kernel_size + 1
         padding = int((kernel_size - 1) / 2)
         self.conv = nn.Conv1d(1, 1, kernel_size=kernel_size, stride=1, padding=padding, bias=False)
-        self.sigmoid = nn.Sigmoid()
+        self.sigmoid = HSigmoid() if use_hs else nn.Sigmoid()
 
     def forward(self, x):
         b, c, _, _ = x.size()
@@ -53,7 +80,7 @@ class ChannelBlock(nn.Module):
     Channel Attention Module
     """
 
-    def __init__(self, channel, ratio=16):
+    def __init__(self, channel, ratio=16, use_hs=True):
         super(ChannelBlock, self).__init__()
         self.avg_pool = nn.AdaptiveAvgPool2d(1)
         self.max_pool = nn.AdaptiveMaxPool2d(1)
@@ -63,7 +90,7 @@ class ChannelBlock(nn.Module):
             nn.Linear(channel // ratio, channel, bias=False),
         )
 
-        self.sigmoid = nn.Sigmoid()
+        self.sigmoid = HSigmoid if use_hs else nn.Sigmoid()
 
     def forward(self, x):
         b, c, _, _ = x.size()
@@ -83,7 +110,7 @@ class SpatialBlock(nn.Module):
     Spatial Attention Module
     """
 
-    def __init__(self, kernel_size=7):
+    def __init__(self, kernel_size=7, use_hs=True):
         super(SpatialBlock, self).__init__()
         padding = kernel_size // 2
         self.conv = nn.Conv2d(in_channels=2,
@@ -91,7 +118,7 @@ class SpatialBlock(nn.Module):
                               kernel_size=kernel_size,
                               padding=padding,
                               stride=1)
-        self.sigmoid = nn.Sigmoid()
+        self.sigmoid = HSigmoid if use_hs else nn.Sigmoid()
 
     def forward(self, x):
         max_x, _ = torch.max(x, dim=1, keepdim=True)
@@ -107,10 +134,10 @@ class CBAMBlock(nn.Module):
     CBAM: Convolutional Block Attention Module
     """
 
-    def __init__(self, channel, ratio=16, kernel_size=7):
+    def __init__(self, channel, ratio=16, kernel_size=7, use_hs=True):
         super(CBAMBlock, self).__init__()
-        self.channel_attention = ChannelBlock(channel, ratio)
-        self.spatial_attention = SpatialBlock(kernel_size)
+        self.channel_attention = ChannelBlock(channel, ratio, use_hs)
+        self.spatial_attention = SpatialBlock(kernel_size, use_hs)
 
     def forward(self, x):
         x = self.channel_attention(x)
@@ -123,7 +150,7 @@ class CABlock(nn.Module):
     CA: Coordinate Attention
     """
 
-    def __init__(self, channel, reduction=16):
+    def __init__(self, channel, reduction=16, use_hs=True):
         super(CABlock, self).__init__()
 
         self.avg_pool_x = nn.AdaptiveAvgPool2d((None, 1))
@@ -151,8 +178,8 @@ class CABlock(nn.Module):
                              kernel_size=1,
                              stride=1,
                              bias=False)
-        self.sigmoid_h = nn.Sigmoid()
-        self.sigmoid_w = nn.Sigmoid()
+        self.sigmoid_h = HSigmoid if use_hs else nn.Sigmoid()
+        self.sigmoid_w = HSigmoid if use_hs else nn.Sigmoid()
 
     def forward(self, x):
 
@@ -172,11 +199,11 @@ class CABlock(nn.Module):
         return out
 
 
-if __name__ == '__main__':
+def __test_attention():
     b, c, h, w = 1, 24, 224, 224
     input_x = torch.randn(b, c, h, w)
 
-    se_block = SEBlock(c, 16)
+    se_block = SEBlock(c, 16, use_hs=True)
     eca_block = ECABlock(c)
     cbam_block = CBAMBlock(c)
     ca_block = CABlock(c)
@@ -186,15 +213,9 @@ if __name__ == '__main__':
     cbam_out = cbam_block(input_x)
     ca_out = ca_block(input_x)
 
-    print(se_out.shape)
-    print(f'se_out:{se_out}')
+    print(se_block)
 
-    print(eca_out.shape)
-    print(f'eca_out:{eca_out}')
 
-    print(cbam_out.shape)
-    print(f'cbam_out:{cbam_out}')
-
-    print(ca_out.shape)
-    print(f'ca_out:{ca_out}')
-
+if __name__ == '__main__':
+    # __test_attention()
+    pass
